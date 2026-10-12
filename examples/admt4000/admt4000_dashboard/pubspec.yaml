@@ -1,0 +1,23 @@
+name: admt4000_dashboard
+description: Live ADMT4000 angle/turns/temperature dashboard (Windows + Android).
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^2.4.0
+  http: ^1.1.0
+  fl_chart: ^0.66.0
+  shared_preferences: ^2.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
