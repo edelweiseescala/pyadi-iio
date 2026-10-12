@@ -32,6 +32,7 @@ void main() {
       MaterialApp(
         home: Scaffold(
           body: SizedBox(
+            width: 1600,
             height: 900,
             child: CalibrationCharts(results: results),
           ),
@@ -41,15 +42,10 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(tester.takeException(), isNull);
+    // Pre and post are laid out side by side, so both should be visible
+    // simultaneously without needing to scroll either column.
     expect(find.text('Pre-Calibration'), findsOneWidget);
-    expect(find.text('Corrected Error (degrees)'), findsOneWidget);
-
-    await tester.dragUntilVisible(
-      find.text('Post-Calibration'),
-      find.byType(ListView),
-      const Offset(0, -300),
-    );
-    expect(tester.takeException(), isNull);
     expect(find.text('Post-Calibration'), findsOneWidget);
+    expect(find.text('Corrected Error (degrees)'), findsOneWidget);
   });
 }

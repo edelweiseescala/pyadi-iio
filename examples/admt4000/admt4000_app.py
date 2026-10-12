@@ -218,6 +218,7 @@ def run_calibration(
     plot,
     log,
     on_result=lambda data: None,
+    dev=None,
 ):
     amax = 131072
     dmax = int(amax / 2)
@@ -228,8 +229,14 @@ def run_calibration(
     direction = 1 if reversed_shaft else -1
     step_direction = -1 if cw_steps else 1
 
-    cal_setup = admt4000ard1z(uri=uri, motor_direction=direction)
+    owns_device = dev is None
+    cal_setup = dev if dev is not None else admt4000ard1z(uri=uri, motor_direction=direction)
     try:
+        # See run_magnetic_reset's matching comment: large multi-turn
+        # rotations can exceed the serial connection's default read/write
+        # timeout mid-move.
+        cal_setup.ctx.set_timeout(30000)
+
         angle_scale = cal_setup.sensor.angle.scale
         temp_scale = cal_setup.sensor.temp.scale
         temp_offset = cal_setup.sensor.temp.offset
@@ -405,7 +412,8 @@ def run_calibration(
                 " the coefficients to zero."
             )
     finally:
-        del cal_setup
+        if owns_device:
+            del cal_setup
 
 
 ################################################################################
@@ -423,6 +431,8 @@ def run_magnetic_reset(
     full_step_angle,
     log_to_file,
     log,
+    on_result=lambda data: None,
+    dev=None,
 ):
     reset_angle = 315.00
     amax = 131072
@@ -437,14 +447,30 @@ def run_magnetic_reset(
         csv_filename = f"magnetic_reset_{date}.csv"
         log(f"Results will be saved to: {csv_filename}")
 
-    dev = admt4000ard1z(
-        uri=uri,
-        motor_direction=direction,
-        disable_dc_dc_after_reset=disable_dc_dc_after_reset,
-        dc_dc_charge_time_ms=dc_dc_charge_time_ms,
-        reset_pulse_time_ms=reset_duration_ms,
-    )
+    owns_device = dev is None
+    if dev is not None:
+        # Per-request overrides: these are normally constructor kwargs read
+        # later by the magnetic_reset setter, so when reusing an existing
+        # device they must be applied directly instead.
+        dev._disable_dc_dc_after_reset = disable_dc_dc_after_reset
+        dev._dc_dc_charge_time_ms = dc_dc_charge_time_ms
+        dev._reset_pulse_time_ms = reset_duration_ms
+    else:
+        dev = admt4000ard1z(
+            uri=uri,
+            motor_direction=direction,
+            disable_dc_dc_after_reset=disable_dc_dc_after_reset,
+            dc_dc_charge_time_ms=dc_dc_charge_time_ms,
+            reset_pulse_time_ms=reset_duration_ms,
+        )
     try:
+        # Large multi-turn rotations (e.g. to a high starting_turn) can take
+        # longer than the serial connection's default read/write timeout,
+        # causing a transport-level timeout mid-move even though the motor
+        # is still moving correctly. Raise it here rather than in the shared
+        # context_manager base class, which every pyadi-iio driver uses.
+        dev.ctx.set_timeout(30000)
+
         dev.motor.amax = amax
         dev.motor.vmax = vmax
         dev.motor.dmax = dmax
@@ -556,6 +582,14 @@ def run_magnetic_reset(
                 angles_list.append(curr_angle)
                 absolute_angles_list.append(curr_abs_angle)
                 fault_list.append(fault_reg)
+                on_result(
+                    {
+                        "turns": curr_turns,
+                        "angle": curr_angle,
+                        "absolute_angle": curr_abs_angle,
+                        "fault": fault_reg,
+                    }
+                )
 
                 log(f"Rotating by {quarter_turn:.2f}°...")
                 new_angle += quarter_turn
@@ -630,26 +664,45 @@ def run_magnetic_reset(
             plt.tight_layout()
             plt.show()
     finally:
-        del dev
+        if owns_device:
+            del dev
 
 
 ################################################################################
 # 4. TMC5240 basic motor move (tmc5240_basic_example.py)
 ################################################################################
-def run_tmc5240_basic(uri, direction, log):
+def _wait_and_poll_position(dev, on_result, duration_s=2, poll_interval_s=0.1):
+    """Sleep for duration_s total, reporting position every poll_interval_s
+    so a live caller (e.g. the bridge) can chart motion during the wait
+    instead of only before/after it."""
+    for _ in range(int(duration_s / poll_interval_s)):
+        on_result(dev.angular_position.processed)
+        sleep(poll_interval_s)
+
+
+def run_tmc5240_basic(uri, direction, log, on_result=lambda data: None, dev=None):
     amax = 131072
     dmax = int(amax / 2)
     vmax = 127438 * 2
 
-    dev = tmc5240(uri=uri, direction=direction)
+    # admt4000ard1z.motor is a tmc5240 built from the same shared IIO
+    # context, so reusing it here is a drop-in replacement for constructing
+    # a standalone tmc5240 -- same attributes (amax/vmax/dmax/
+    # angular_position) used throughout this function.
+    owns_device = dev is None
+    motor = dev.motor if dev is not None else tmc5240(uri=uri, direction=direction)
+    dev = motor
     try:
         dev.amax = amax
         dev.vmax = vmax
         dev.dmax = dmax
 
+        on_result(dev.angular_position.processed)
         log(
-            "Current position: {:.4f}° {} microsteps".format(
-                dev.angular_position.processed, dev.angular_position.raw
+            "Current position: {:.4f}° ({:.4f}° wrapped) {} microsteps".format(
+                dev.angular_position.processed,
+                dev.angular_position.processed % 360,
+                dev.angular_position.raw,
             )
         )
         target_angle = int(dev.angular_position.processed) + 120
@@ -661,20 +714,24 @@ def run_tmc5240_basic(uri, direction, log):
                 / (dev.angular_position.scale * dev.angular_position.calibscale),
             )
         )
-        sleep(2)
+        _wait_and_poll_position(dev, on_result)
         log(
-            "Current position: {:.4f}° {} microsteps".format(
-                dev.angular_position.processed, dev.angular_position.raw
+            "Current position: {:.4f}° ({:.4f}° wrapped) {} microsteps".format(
+                dev.angular_position.processed,
+                dev.angular_position.processed % 360,
+                dev.angular_position.raw,
             )
         )
 
         move_actual = 0
         log("Set Current position to: {:.4f}°".format(move_actual))
         dev.angular_position.processed = move_actual
-        sleep(2)
+        _wait_and_poll_position(dev, on_result)
         log(
-            "Current position: {:.4f}° {} microsteps".format(
-                dev.angular_position.processed, dev.angular_position.raw
+            "Current position: {:.4f}° ({:.4f}° wrapped) {} microsteps".format(
+                dev.angular_position.processed,
+                dev.angular_position.processed % 360,
+                dev.angular_position.raw,
             )
         )
 
@@ -688,10 +745,12 @@ def run_tmc5240_basic(uri, direction, log):
                 target_usteps,
             )
         )
-        sleep(2)
+        _wait_and_poll_position(dev, on_result)
         log(
-            "Current position: {:.4f}° {} microsteps".format(
-                dev.angular_position.processed, dev.angular_position.raw
+            "Current position: {:.4f}° ({:.4f}° wrapped) {} microsteps".format(
+                dev.angular_position.processed,
+                dev.angular_position.processed % 360,
+                dev.angular_position.raw,
             )
         )
 
@@ -705,20 +764,23 @@ def run_tmc5240_basic(uri, direction, log):
                 target_usteps,
             )
         )
-        sleep(2)
+        _wait_and_poll_position(dev, on_result)
         log(
-            "Current position: {:.4f}° {} microsteps".format(
-                dev.angular_position.processed, dev.angular_position.raw
+            "Current position: {:.4f}° ({:.4f}° wrapped) {} microsteps".format(
+                dev.angular_position.processed,
+                dev.angular_position.processed % 360,
+                dev.angular_position.raw,
             )
         )
     finally:
-        del dev
+        if owns_device:
+            del dev
 
 
 ################################################################################
 # 5. True power-down (true_powerdown_example.py)
 ################################################################################
-def run_true_powerdown(uri, reversed_shaft, cw_steps, log):
+def run_true_powerdown(uri, reversed_shaft, cw_steps, log, dev=None):
     direction = 1 if reversed_shaft else -1
     step_direction = -1 if cw_steps else 1
 
@@ -731,8 +793,15 @@ def run_true_powerdown(uri, reversed_shaft, cw_steps, log):
     target_starting_angle = starting_angle + starting_turn * FULL_TURN
     target_displacement = 1090
 
-    dev = admt4000ard1z(uri=uri, motor_direction=direction)
+    owns_device = dev is None
+    if dev is None:
+        dev = admt4000ard1z(uri=uri, motor_direction=direction)
     try:
+        # See run_magnetic_reset's matching comment: large multi-turn
+        # rotations can exceed the serial connection's default read/write
+        # timeout mid-move.
+        dev.ctx.set_timeout(30000)
+
         dev.motor.amax = amax
         dev.motor.vmax = vmax
         dev.motor.dmax = dmax
@@ -764,7 +833,8 @@ def run_true_powerdown(uri, reversed_shaft, cw_steps, log):
         dev.sensor.reinitialize()
         print_current_position(motor=dev.motor, sensor=dev.sensor, log=log)
     finally:
-        del dev
+        if owns_device:
+            del dev
 
 
 ################################################################################

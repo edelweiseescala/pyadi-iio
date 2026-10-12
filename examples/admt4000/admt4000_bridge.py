@@ -11,10 +11,17 @@ Also exposes the 4 long-running action routines from admt4000_app.py
 (calibration, magnetic reset, TMC5240 motor move, true power-down) as
 background jobs: POST /actions/<name> starts a job and returns a job id,
 GET /jobs/<id> polls status, WS /jobs/<id>/stream tails its log lines.
-Only one job runs at a time, and the live /stream connection is paused
-(device handle released) while a job owns the serial port, resuming once
-the job finishes. Jobs cannot be cancelled once started -- none of the
-underlying run_* functions support cooperative cancellation.
+Only one job runs at a time. Jobs cannot be cancelled once started --
+none of the underlying run_* functions support cooperative cancellation.
+
+The bridge holds exactly ONE admt4000ard1z connection for its entire
+process lifetime and shares it between live reads and action jobs --
+confirmed via direct hardware testing that opening a SECOND connection to
+this device's serial port within the same process reliably fails
+(sp_blocking_read_next timeout on the admt_evb control device's first
+write, likely an Arduino-style DTR-reset-on-first-open quirk on the eval
+board). A DeviceState-level lock serializes live reads and job device
+access against each other since they now share one device instance.
 
 Usage:
     python admt4000_bridge.py --uri serial:COM10,230400,8n1 --host 0.0.0.0 --port 8765
@@ -37,7 +44,7 @@ from admt4000_app import (
     run_true_powerdown,
     run_tmc5240_basic,
 )
-from adi.admt4000 import admt4000
+from adi.admt4000ard1z import admt4000ard1z
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("admt4000_bridge")
@@ -94,12 +101,29 @@ class PowerdownRequest(BaseModel):
 
 
 class DeviceState:
-    """Holds the current admt4000 connection; swappable via /connect."""
+    """Holds THE ONE admt4000ard1z connection for the bridge's whole process
+    lifetime; swappable only via /connect (e.g. switching COM ports), never
+    torn down/recreated around an action job -- confirmed by direct hardware
+    testing that a second connection to this device within one process
+    reliably fails. Live reads go through dev.sensor; action jobs reuse
+    dev directly (see JobManager).
+
+    Confirmed by direct hardware testing: once dev.sensor.rx() has been
+    called (the live-stream's buffered read), ALL subsequent writes to the
+    separate admt_evb control device (shutdown_pulse/coil_reset/
+    power_enable -- used by magnetic_reset and true_powerdown) permanently
+    fail with a low-level serial timeout, for the rest of this connection's
+    lifetime. The reverse order is fine (control writes, then rx(), works).
+    rx_started latches True the first time read() successfully calls rx(),
+    and JobManager refuses to start ANY action job once it's set -- the only
+    way to clear it is to restart the bridge process (a fresh connection).
+    """
 
     def __init__(self, uri):
         self.uri = uri
         self.dev = None
         self.error = None
+        self.rx_started = False
         self._lock = threading.Lock()
         self.connect(uri)
 
@@ -112,46 +136,33 @@ class DeviceState:
                     pass
                 self.dev = None
             try:
-                dev = admt4000(uri=uri)
+                dev = admt4000ard1z(uri=uri, motor_direction=-1)
                 # Must be set before the first rx() call -- the rx buffer is
                 # lazily created on first use and these settings have no
                 # effect once that buffer exists (see adi/rx_tx.py).
-                dev.rx_output_type = "SI"
-                dev.rx_enabled_channels = [0, 1]  # turns, angle
+                dev.sensor.rx_output_type = "SI"
+                dev.sensor.rx_enabled_channels = [0, 1]  # turns, angle
                 self.dev = dev
                 self.uri = uri
                 self.error = None
+                self.rx_started = False
             except Exception as e:  # noqa: BLE001
                 self.dev = None
                 self.error = str(e)
                 logger.warning("Failed to connect to %s: %s", uri, e)
 
-    def pause(self):
-        """Release the device handle so another connection (a job) can use the port."""
-        with self._lock:
-            if self.dev is not None:
-                try:
-                    del self.dev
-                except Exception:  # noqa: BLE001
-                    pass
-                self.dev = None
-            self.error = "Paused for an action job"
-
-    def resume(self):
-        """Reconnect on the last known URI after a job releases the port."""
-        self.connect(self.uri)
-
     def read(self):
         with self._lock:
             if self.dev is None:
                 raise RuntimeError(self.error or "Device not connected")
-            dev = self.dev
+            dev = self.dev.sensor
 
             # Buffered channel read, matching the data path basic_example.py's
             # --plot mode uses for the live angle trace -- NOT dev.angle.raw,
             # which is a different (unbuffered) attribute path with different
             # values/timing on this driver.
             turns_samples, angle_samples = dev.rx()
+            self.rx_started = True
             angle_deg = angle_samples[-1]
 
             # Turn count for the stat tile and absolute-angle math comes from
@@ -215,6 +226,10 @@ class Job:
         with self._lock:
             return list(self.lines[after:])
 
+    def results_snapshot(self, after=0):
+        with self._lock:
+            return list(self.results[after:])
+
     def finish(self, error=None):
         with self._lock:
             self.status = "error" if error else "done"
@@ -222,11 +237,9 @@ class Job:
 
 
 class JobManager:
-    """Runs one admt4000_app.py run_* function at a time as a background job.
-
-    Pauses the bridge's own live-reading connection before a job starts
-    (the job opens its own device handle on the same serial port) and
-    resumes it once the job finishes.
+    """Runs one admt4000_app.py run_* function at a time as a background job,
+    reusing the bridge's single persistent device connection (never opens a
+    second connection -- see DeviceState's docstring for why).
     """
 
     def __init__(self, device_state):
@@ -241,24 +254,41 @@ class JobManager:
                 raise HTTPException(
                     status_code=409, detail="Another action job is already running"
                 )
+            if self.device_state.rx_started:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Actions are unavailable: live monitoring has already run on"
+                        " this connection, which permanently breaks control-device"
+                        " writes (confirmed on this hardware). Restart the bridge to"
+                        " reconnect and re-enable actions."
+                    ),
+                )
             job = Job(str(uuid.uuid4()))
             self.jobs[job.id] = job
             self.current = job
 
-        self.device_state.pause()
-
         def wrapper():
-            try:
-                if pass_result_callback:
-                    target(*args, job.log, job.add_result)
-                else:
-                    target(*args, job.log)
-                job.finish()
-            except Exception as e:  # noqa: BLE001
-                job.log(f"ERROR: {e}")
-                job.finish(error=str(e))
-            finally:
-                self.device_state.resume()
+            # Hold the device lock for the job's entire duration -- live
+            # reads (DeviceState.read()) and this job now access the SAME
+            # device instance, so they must not interleave at the hardware
+            # level. /stream's reads naturally block for this duration and
+            # resume automatically once the job releases the lock.
+            with self.device_state._lock:
+                dev = self.device_state.dev
+                if dev is None:
+                    job.log(f"ERROR: {self.device_state.error or 'Device not connected'}")
+                    job.finish(error=self.device_state.error or "Device not connected")
+                    return
+                try:
+                    if pass_result_callback:
+                        target(*args, job.log, job.add_result, dev=dev)
+                    else:
+                        target(*args, job.log, dev=dev)
+                    job.finish()
+                except Exception as e:  # noqa: BLE001
+                    job.log(f"ERROR: {e}")
+                    job.finish(error=str(e))
 
         threading.Thread(target=wrapper, daemon=True).start()
         return job.id
@@ -281,6 +311,7 @@ def status():
         "connected": state.dev is not None,
         "error": state.error,
         "compatible_parts": state.dev.compatible_parts if state.dev else None,
+        "rx_started": state.rx_started,
     }
 
 
@@ -304,7 +335,12 @@ async def stream(websocket: WebSocket, interval_ms: int = 200):
     try:
         while True:
             try:
-                payload = state.read()
+                # state.read() blocks on real hardware I/O (dev.rx()) --
+                # offload it to a thread so it doesn't block the asyncio
+                # event loop. Without this, a slow/blocked read here could
+                # starve other requests, including an /actions/* call
+                # waiting to acquire DeviceState._lock for a job's duration.
+                payload = await asyncio.to_thread(state.read)
             except Exception as e:  # noqa: BLE001
                 payload = {"error": str(e)}
             await websocket.send_json(payload)
@@ -349,13 +385,19 @@ def action_magnetic_reset(req: MagneticResetRequest):
         req.reversed_shaft,
         req.full_step_angle,
         req.log_to_file,
+        pass_result_callback=True,
     )
     return {"job_id": job_id}
 
 
 @app.post("/actions/tmc5240_move")
 def action_tmc5240_move(req: Tmc5240MoveRequest):
-    job_id = jobs.start(run_tmc5240_basic, req.uri or state.uri, req.direction)
+    job_id = jobs.start(
+        run_tmc5240_basic,
+        req.uri or state.uri,
+        req.direction,
+        pass_result_callback=True,
+    )
     return {"job_id": job_id}
 
 
@@ -393,12 +435,19 @@ async def job_stream(websocket: WebSocket, job_id: str, interval_ms: int = 200):
         return
 
     sent = 0
+    results_sent = 0
     try:
         while True:
             new_lines = job.snapshot(after=sent)
             for line in new_lines:
                 await websocket.send_json({"line": line})
             sent += len(new_lines)
+
+            new_results = job.results_snapshot(after=results_sent)
+            for result in new_results:
+                await websocket.send_json({"result": result})
+            results_sent += len(new_results)
+
             if job.status != "running":
                 await websocket.send_json(
                     {
