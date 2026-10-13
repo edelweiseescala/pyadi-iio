@@ -104,19 +104,36 @@ class DeviceState:
     """Holds THE ONE admt4000ard1z connection for the bridge's whole process
     lifetime; swappable only via /connect (e.g. switching COM ports), never
     torn down/recreated around an action job -- confirmed by direct hardware
-    testing that a second connection to this device within one process
-    reliably fails. Live reads go through dev.sensor; action jobs reuse
-    dev directly (see JobManager).
+    testing that a second connection to this device within one process can
+    fail outright (see repro_reconnect_test.py). Live reads go through
+    dev.sensor; action jobs reuse dev directly (see JobManager).
 
-    Confirmed by direct hardware testing: once dev.sensor.rx() has been
-    called (the live-stream's buffered read), ALL subsequent writes to the
-    separate admt_evb control device (shutdown_pulse/coil_reset/
-    power_enable -- used by magnetic_reset and true_powerdown) permanently
-    fail with a low-level serial timeout, for the rest of this connection's
-    lifetime. The reverse order is fine (control writes, then rx(), works).
-    rx_started latches True the first time read() successfully calls rx(),
-    and JobManager refuses to start ANY action job once it's set -- the only
-    way to clear it is to restart the bridge process (a fresh connection).
+    Two distinct hardware issues were found by direct testing on this board:
+
+    1. Once dev.sensor.rx() has been called (the live-stream's buffered
+       read), all subsequent writes to the separate admt_evb control device
+       (shutdown_pulse/coil_reset/power_enable -- used by magnetic_reset and
+       true_powerdown) permanently fail with a low-level serial timeout, for
+       the rest of this connection's lifetime. The reverse order is fine
+       (control writes, then rx(), works). rx_started latches True the first
+       time read() successfully calls rx(), and JobManager refuses to start
+       a job that touches admt_evb (requires_control_device=True) once it's
+       set. Calibration and the motor move only touch .sensor/.motor, which
+       were never shown to break from rx() alone, so they stay available.
+
+    2. Separately, a long/heavy calibration run was observed to sometimes
+       leave the connection unable to complete whatever job runs next --
+       not limited to admt_evb, also seen breaking a plain motor move and
+       Live's rx() reads. This was intermittent (not reproduced in
+       isolation every time) and never pinned to a specific cause.
+       Auto-reconnecting after calibration was tried as a mitigation but
+       reliably failed itself on this board (opening a second in-process
+       connection is unreliable here -- see repro_reconnect_test.py), so
+       it was removed; this issue has NO mitigation right now. If it
+       happens, use /connect (best effort) or restart the bridge.
+
+    Clearing rx_started (issue 1) needs a fresh connection too: restart the
+    bridge, or use /connect (best effort -- see repro_reconnect_test.py).
     """
 
     def __init__(self, uri):
@@ -248,20 +265,26 @@ class JobManager:
         self.current = None
         self.jobs = {}
 
-    def start(self, target, *args, pass_result_callback=False):
+    def start(
+        self,
+        target,
+        *args,
+        pass_result_callback=False,
+        requires_control_device=False,
+    ):
         with self._lock:
             if self.current is not None and self.current.status == "running":
                 raise HTTPException(
                     status_code=409, detail="Another action job is already running"
                 )
-            if self.device_state.rx_started:
+            if requires_control_device and self.device_state.rx_started:
                 raise HTTPException(
                     status_code=409,
                     detail=(
                         "Actions are unavailable: live monitoring has already run on"
                         " this connection, which permanently breaks control-device"
-                        " writes (confirmed on this hardware). Restart the bridge to"
-                        " reconnect and re-enable actions."
+                        " writes (confirmed on this hardware). Use Reconnect or"
+                        " restart the bridge to re-enable this action."
                     ),
                 )
             job = Job(str(uuid.uuid4()))
@@ -386,6 +409,7 @@ def action_magnetic_reset(req: MagneticResetRequest):
         req.full_step_angle,
         req.log_to_file,
         pass_result_callback=True,
+        requires_control_device=True,
     )
     return {"job_id": job_id}
 
@@ -408,6 +432,7 @@ def action_powerdown(req: PowerdownRequest):
         req.uri or state.uri,
         req.reversed_shaft,
         req.cw_steps,
+        requires_control_device=True,
     )
     return {"job_id": job_id}
 
