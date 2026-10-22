@@ -44,6 +44,7 @@ from admt4000_app import (
     run_true_powerdown,
     run_tmc5240_basic,
 )
+from adi.admt4000 import admt4000
 from adi.admt4000ard1z import admt4000ard1z
 
 logging.basicConfig(level=logging.INFO)
@@ -60,6 +61,9 @@ app.add_middleware(
 
 class ConnectRequest(BaseModel):
     uri: str
+    mode: str = None  # "buffered" | "polling"; omit to keep the current mode
+
+
 
 
 class CalibrationRequest(BaseModel):
@@ -101,12 +105,33 @@ class PowerdownRequest(BaseModel):
 
 
 class DeviceState:
-    """Holds THE ONE admt4000ard1z connection for the bridge's whole process
+    """Holds THE ONE device connection for the bridge's whole process
     lifetime; swappable only via /connect (e.g. switching COM ports), never
     torn down/recreated around an action job -- confirmed by direct hardware
     testing that a second connection to this device within one process can
     fail outright (see repro_reconnect_test.py). Live reads go through
     dev.sensor; action jobs reuse dev directly (see JobManager).
+
+    Two mutually exclusive connection modes, selected by `mode` -- there is
+    deliberately NO "auto" mode: both a throwaway probe connection and a
+    sequential try-buffered-then-fall-back-to-polling approach were tried
+    and both reliably hang/crash this hardware on the SECOND connection
+    attempt within the same process, even after the first attempt's object
+    has gone out of scope on exception (confirmed by direct testing; see
+    repro_reconnect_test.py). The caller must know and pass the right mode
+    for their backend/board up front.
+
+    - "buffered": connects via admt4000ard1z (admt_evb + TMC5240 required in
+      the IIO context) and reads live data with dev.sensor.rx(), matching
+      the no-OS backend's buffer support. Action jobs (calibration, magnetic
+      reset, motor move, power-down) are available in this mode.
+    - "polling": connects via the plain admt4000 driver (no admt_evb/motor
+      needed), for backends without buffer support -- e.g. the Zephyr
+      admt4000 IIO driver, which only implements create/read_attr/write_attr
+      (confirmed via iio_info: no open_buffer/readbuf hook, no admt_evb
+      device, no faults attribute). Reads poll raw/processed attributes one
+      sample at a time, exactly like basic_example_polling.py. Action jobs
+      are unavailable in this mode (no admt_evb/motor device exists).
 
     Two distinct hardware issues were found by direct testing on this board:
 
@@ -136,15 +161,17 @@ class DeviceState:
     bridge, or use /connect (best effort -- see repro_reconnect_test.py).
     """
 
-    def __init__(self, uri):
+    def __init__(self, uri, mode="buffered"):
         self.uri = uri
+        self.mode = mode
         self.dev = None
         self.error = None
         self.rx_started = False
         self._lock = threading.Lock()
-        self.connect(uri)
+        self.connect(uri, mode)
 
-    def connect(self, uri):
+    def connect(self, uri, mode=None):
+        mode = mode or self.mode
         with self._lock:
             if self.dev is not None:
                 try:
@@ -153,62 +180,107 @@ class DeviceState:
                     pass
                 self.dev = None
             try:
-                dev = admt4000ard1z(uri=uri, motor_direction=-1)
-                # Must be set before the first rx() call -- the rx buffer is
-                # lazily created on first use and these settings have no
-                # effect once that buffer exists (see adi/rx_tx.py).
-                dev.sensor.rx_output_type = "SI"
-                dev.sensor.rx_enabled_channels = [0, 1]  # turns, angle
+                if mode == "polling":
+                    dev = admt4000(uri=uri)
+                else:
+                    dev = admt4000ard1z(uri=uri, motor_direction=-1)
+                    # Must be set before the first rx() call -- the rx buffer
+                    # is lazily created on first use and these settings have
+                    # no effect once that buffer exists (see adi/rx_tx.py).
+                    dev.sensor.rx_output_type = "SI"
+                    dev.sensor.rx_enabled_channels = [0, 1]  # turns, angle
                 self.dev = dev
                 self.uri = uri
+                self.mode = mode
                 self.error = None
                 self.rx_started = False
             except Exception as e:  # noqa: BLE001
                 self.dev = None
+                self.mode = mode
                 self.error = str(e)
-                logger.warning("Failed to connect to %s: %s", uri, e)
+                logger.warning("Failed to connect to %s (mode=%s): %s", uri, mode, e)
 
     def read(self):
         with self._lock:
             if self.dev is None:
                 raise RuntimeError(self.error or "Device not connected")
-            dev = self.dev.sensor
 
-            # Buffered channel read, matching the data path basic_example.py's
-            # --plot mode uses for the live angle trace -- NOT dev.angle.raw,
-            # which is a different (unbuffered) attribute path with different
-            # values/timing on this driver.
-            turns_samples, angle_samples = dev.rx()
-            self.rx_started = True
-            angle_deg = angle_samples[-1]
+            if self.mode == "polling":
+                return self._read_polling()
+            return self._read_buffered()
 
-            # Turn count for the stat tile and absolute-angle math comes from
-            # the plain attribute (turns.processed), matching every other
-            # example script's absolute-angle calculation (never the rx
-            # buffer's turns channel). This value is fractional -- it
-            # increments gradually through a revolution (e.g. 0.25 per
-            # quarter turn), reaching a whole number only once a full 360
-            # degree revolution completes -- so floor() is used below to
-            # count only completed revolutions, matching
-            # magnetic_reset_example.py's own
-            # "math.floor(curr_turns) * FULL_TURN + curr_angle" pattern.
-            turns = dev.turns.processed
+    def _read_buffered(self):
+        dev = self.dev.sensor
 
-            temp_raw = dev.temp.raw
-            temp_c = (temp_raw + dev.temp.offset) * dev.temp.scale / 1000
+        # Buffered channel read, matching the data path basic_example.py's
+        # --plot mode uses for the live angle trace -- NOT dev.angle.raw,
+        # which is a different (unbuffered) attribute path with different
+        # values/timing on this driver.
+        turns_samples, angle_samples = dev.rx()
+        self.rx_started = True
+        angle_deg = angle_samples[-1]
+
+        # Turn count for the stat tile and absolute-angle math comes from
+        # the plain attribute (turns.processed), matching every other
+        # example script's absolute-angle calculation (never the rx
+        # buffer's turns channel). This value is fractional -- it
+        # increments gradually through a revolution (e.g. 0.25 per
+        # quarter turn), reaching a whole number only once a full 360
+        # degree revolution completes -- so floor() is used below to
+        # count only completed revolutions, matching
+        # magnetic_reset_example.py's own
+        # "math.floor(curr_turns) * FULL_TURN + curr_angle" pattern.
+        turns = dev.turns.processed
+
+        temp_raw = dev.temp.raw
+        temp_c = (temp_raw + dev.temp.offset) * dev.temp.scale / 1000
+        faults = dev.faults
+        abs_angle_deg = angle_deg + math.floor(turns) * 360
+
+        return {
+            "angle_deg": angle_deg,
+            "turns": turns,
+            "angle_samples": _json_safe(angle_samples),
+            "turns_samples": _json_safe(turns_samples),
+            "temp_c": temp_c,
+            "faults": faults,
+            "faults_hex": "0x{:04X}".format(faults),
+            "abs_angle_deg": abs_angle_deg,
+        }
+
+    def _read_polling(self):
+        # One sample per channel directly, exactly like
+        # basic_example_polling.py -- no buffer support required, for
+        # backends like the Zephyr admt4000 IIO driver.
+        dev = self.dev
+        angle_deg = dev.angle.processed
+        turns = dev.turns.processed
+        # Unlike the no-OS buffered path's dev.temp scale (milli-degrees,
+        # hence /1000 there), the Zephyr admt4000 device's temp scale is
+        # already in whole degrees C -- confirmed via iio_info
+        # (raw=35661760, scale=0.000001 -> processed=35.66 C directly).
+        temp_c = dev.temp.processed
+
+        try:
             faults = dev.faults
-            abs_angle_deg = angle_deg + math.floor(turns) * 360
+            faults_hex = "0x{:04X}".format(faults)
+        except Exception:  # noqa: BLE001
+            # The Zephyr admt4000 device doesn't expose a faults attribute.
+            faults = None
+            faults_hex = None
 
-            return {
-                "angle_deg": angle_deg,
-                "turns": turns,
-                "angle_samples": _json_safe(angle_samples),
-                "turns_samples": _json_safe(turns_samples),
-                "temp_c": temp_c,
-                "faults": faults,
-                "faults_hex": "0x{:04X}".format(faults),
-                "abs_angle_deg": abs_angle_deg,
-            }
+        abs_angle_deg = angle_deg + math.floor(turns) * 360
+
+        return {
+            "angle_deg": angle_deg,
+            "turns": turns,
+            "angle_samples": [angle_deg],
+            "turns_samples": [turns],
+            "temp_c": temp_c,
+            "faults": faults,
+            "faults_hex": faults_hex,
+            "abs_angle_deg": abs_angle_deg,
+        }
 
 
 def _json_safe(value):
@@ -273,6 +345,14 @@ class JobManager:
         requires_control_device=False,
     ):
         with self._lock:
+            if self.device_state.mode == "polling":
+                raise HTTPException(
+                    status_code=501,
+                    detail=(
+                        "Action unavailable: bridge is in Zephyr polling mode"
+                        " (no admt_evb/motor present on this device)."
+                    ),
+                )
             if self.current is not None and self.current.status == "running":
                 raise HTTPException(
                     status_code=409, detail="Another action job is already running"
@@ -331,6 +411,7 @@ jobs: JobManager = None
 def status():
     return {
         "uri": state.uri,
+        "mode": state.mode,
         "connected": state.dev is not None,
         "error": state.error,
         "compatible_parts": state.dev.compatible_parts if state.dev else None,
@@ -348,7 +429,7 @@ def reading():
 
 @app.post("/connect")
 def connect(req: ConnectRequest):
-    state.connect(req.uri)
+    state.connect(req.uri, req.mode)
     return status()
 
 
@@ -512,9 +593,26 @@ def main():
         default=8765,
         help="Port to bind the bridge server to (default: 8765).",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["buffered", "polling"],
+        default="buffered",
+        help="'buffered' (default) connects via admt4000ard1z and reads live"
+        " data with dev.sensor.rx() -- requires admt_evb/TMC5240 in the IIO"
+        " context (no-OS backend). 'polling' connects via the plain admt4000"
+        " driver and polls raw attributes one sample at a time -- for"
+        " backends without buffer support, e.g. the Zephyr admt4000 IIO"
+        " driver. Action jobs (calibration, magnetic reset, motor move,"
+        " power-down) are unavailable in polling mode. There is no 'auto'"
+        " mode -- probing/trying one mode then falling back to the other"
+        " both reliably hang this hardware on the second connection attempt"
+        " within the same process (confirmed by direct testing), so you must"
+        " know and pass the right mode for your board.",
+    )
     args = parser.parse_args()
 
-    state = DeviceState(args.uri)
+    state = DeviceState(args.uri, args.mode)
     jobs = JobManager(state)
     if state.error:
         logger.warning(
