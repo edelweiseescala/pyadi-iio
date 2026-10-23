@@ -106,3 +106,20 @@ install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
 install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
   CONFIGURATIONS Profile;Release
   COMPONENT Runtime)
+
+# Bundle the frozen Python bridge (bridge.exe + libiio runtime DLLs) next to
+# the app executable, so the Release folder is fully self-contained -- see
+# scripts/build_bridge.ps1, which produces windows/bridge/ as a PyInstaller
+# build step run separately from `flutter build` (not wired into the CMake
+# build graph itself, since it requires a Python environment that isn't
+# guaranteed to be present when building the Flutter side alone).
+set(BUNDLED_BRIDGE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bridge")
+if(EXISTS "${BUNDLED_BRIDGE_DIR}")
+  install(DIRECTORY "${BUNDLED_BRIDGE_DIR}"
+    DESTINATION "${CMAKE_INSTALL_PREFIX}"
+    COMPONENT Runtime)
+else()
+  message(WARNING
+    "windows/bridge/ not found -- the built app will be missing bridge.exe. "
+    "Run scripts/build_bridge.ps1 before distributing.")
+endif()
