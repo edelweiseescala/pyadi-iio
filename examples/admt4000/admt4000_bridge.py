@@ -189,6 +189,14 @@ class DeviceState:
                     # no effect once that buffer exists (see adi/rx_tx.py).
                     dev.sensor.rx_output_type = "SI"
                     dev.sensor.rx_enabled_channels = [0, 1]  # turns, angle
+                    # On libiio >= 1.0, iio.Stream pipelines
+                    # rx_buffer_num_blocks buffers deep (default 4) before
+                    # data reaches rx() -- for Live's small buffer size that
+                    # was visible as ~500ms of lag behind real sensor motion
+                    # (see basic_example.py for the same fix). No effect on
+                    # libiio 0.X, which doesn't pipeline.
+                    if hasattr(dev.sensor, "rx_buffer_num_blocks"):
+                        dev.sensor.rx_buffer_num_blocks = 1
                 self.dev = dev
                 self.uri = uri
                 self.mode = mode
