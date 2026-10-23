@@ -475,10 +475,10 @@ def run_magnetic_reset(
         dev.motor.vmax = vmax
         dev.motor.dmax = dmax
 
-        try:
-            board_id = dev.ctx._attrs["hw_mezzanine"]
-        except KeyError:
-            board_id = "EVAL-ADTM4000ARD1Z"
+        # try:
+        #     board_id = dev.ctx._attrs["hw_mezzanine"]
+        # except KeyError:
+        board_id = "EVAL-ADTM4000ARD1Z"
 
         if csv_filename:
             with open(csv_filename, "w") as f:

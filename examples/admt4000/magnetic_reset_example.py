@@ -303,10 +303,10 @@ if __name__ == "__main__":
     dev.motor.dmax = dmax
     usteps_per_full_step = 1 / dev.motor.angular_position.scale
 
-    try:
-        board_id = dev.ctx._attrs["hw_mezzanine"]
-    except KeyError:
-        board_id = "EVAL-ADTM4000ARD1Z"
+    # try:
+    #     board_id = dev.ctx._attrs["hw_mezzanine"]
+    # except KeyError:
+    board_id = "EVAL-ADTM4000ARD1Z"
 
     if log_to_file:
         log_test_result_to_file(csv_filename, "w", "BOARD ID", board_id)
