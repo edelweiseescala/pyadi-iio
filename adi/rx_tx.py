@@ -121,6 +121,7 @@ class rx_core(rx_tx_common, metaclass=ABCMeta):
     @rx_buffer_size.setter
     def rx_buffer_size(self, value):
         self._rx_buffer_size = value
+        self.rx_destroy_buffer()
 
     @property
     def rx_enabled_channels(self) -> Union[List[int], List[str]]:
@@ -170,6 +171,7 @@ class rx_core(rx_tx_common, metaclass=ABCMeta):
                 if max(value) > ((self._num_rx_channels) - 1):
                     raise Exception("RX mapping exceeds available channels")
         self.__rx_enabled_channels = value
+        self.rx_destroy_buffer()
 
     @property
     def _num_rx_channels_enabled(self):
@@ -178,6 +180,10 @@ class rx_core(rx_tx_common, metaclass=ABCMeta):
     def rx_destroy_buffer(self):
         """rx_destroy_buffer: Clears RX buffer"""
         self._rxbuf = None
+        if hasattr(self, "_rx_stream"):
+            self._rx_stream = None
+        if hasattr(self, "_rx_buffer_mask"):
+            self._rx_buffer_mask = None
 
     def __del__(self):
         self._rxbuf = []

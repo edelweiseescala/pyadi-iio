@@ -22,6 +22,22 @@ class compat_libiio_v1_rx:
     _rx_stream = None
     _rx_buffer_num_blocks = 4
 
+    @property
+    def rx_buffer_num_blocks(self):
+        """rx_buffer_num_blocks: Number of blocks (each rx_buffer_size samples)
+        pipelined by the libiio v1 iio.Stream. Higher values favor throughput
+        at the cost of latency -- each block returned by rx() can be up to
+        rx_buffer_num_blocks * rx_buffer_size samples old. Lower this (e.g.
+        to 1) for latency-sensitive live plotting/monitoring. Only used on
+        libiio >= 1.0; has no effect on the v0.X buffer model.
+        """
+        return self._rx_buffer_num_blocks
+
+    @rx_buffer_num_blocks.setter
+    def rx_buffer_num_blocks(self, value):
+        self._rx_buffer_num_blocks = value
+        self.rx_destroy_buffer()
+
     def _rx_init_channels(self):
         if not self._rx_buffer_mask:
             self._rx_buffer_mask = iio.ChannelsMask(self._rxadc)
