@@ -50,6 +50,13 @@ if __name__ == "__main__":
     print(dev.rx())
     dev.rx_buffer_size = 20
     dev.rx_enabled_channels = [0, 1]
+    # On libiio >= 1.0, iio.Stream pipelines rx_buffer_num_blocks buffers of
+    # rx_buffer_size samples each (default 4) before data reaches rx() --
+    # that's up to 4 * 20 = 80 samples of latency, visible as lag in the
+    # live plot below. Minimize it for live monitoring; has no effect on
+    # libiio 0.X, which doesn't pipeline.
+    if hasattr(dev, "rx_buffer_num_blocks"):
+        dev.rx_buffer_num_blocks = 1
     if enable_plot:
         # Create figure for plotting
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
